@@ -134,13 +134,20 @@ EOF
 
 read_password () {
     [ -t 0 ] || abort "ERROR: --pass not given and no terminal to read it from"
-    printf 'Wifi password for %s: ' "$WIFI_SSID" >&2
     stty -echo
     trap 'stty echo' EXIT
+    printf 'Wifi password for %s: ' "$WIFI_SSID" >&2
     IFS= read -r WIFI_PASS || true
+    printf '\nConfirm password: ' >&2
+    IFS= read -r WIFI_PASS2 || true
     stty echo
     trap - EXIT
     echo >&2
+    # Some Windows terminals (mintty) can leave a CR at the end of the line
+    WIFI_PASS="$(printf '%s' "$WIFI_PASS" | tr -d '\r')"
+    WIFI_PASS2="$(printf '%s' "$WIFI_PASS2" | tr -d '\r')"
+    [ "$WIFI_PASS" = "$WIFI_PASS2" ] || abort "ERROR: the passwords do not match"
+    echo "(password is ${#WIFI_PASS} characters long)" >&2
 }
 
 connect_wifi () {
