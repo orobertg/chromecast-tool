@@ -17,7 +17,12 @@
 
 set -e
 
-CURL="curl -s --insecure --tlsv1.2 --tls-max 1.2"
+# --fail makes curl return an error on HTTP 4xx/5xx responses and
+# -S still shows the error message despite -s.
+CURL="curl -sS --fail --insecure --tlsv1.2 --tls-max 1.2"
+
+# How many times to poll for the wifi scan results (1 second apart)
+SCAN_ATTEMPTS=20
 
 abort () {
     echo "$1" >&2
@@ -42,7 +47,8 @@ show_usage () {
 
 	Options for the 'connect-wifi' command:
 	   --ssid         Connect the Chromecast to this network.
-	   --pass         Wifi password.
+	   --pass         Wifi password. If omitted it is read from the
+	                  terminal without echoing it.
 
 	Options for the 'set-config' command:
 	   --name         Set the visible name of the Chromecast.
@@ -55,14 +61,16 @@ EOF
 
 require_cmd () {
     for cmd in "$@"; do
-        command -v $cmd > /dev/null || abort "ERROR: $cmd not found"
+        command -v "$cmd" > /dev/null || abort "ERROR: $cmd not found"
     done
 }
 
 parse_options () {
     local OPTNAMES="help,addr:,$1"
+    local OPTS
     shift
-    local OPTS=$(getopt -s sh -l ${OPTNAMES%,} -n chromecast-tool -- "" "$@")
+    # Assign separately from 'local' so that a getopt failure is not masked
+    OPTS=$(getopt -s sh -l "${OPTNAMES%,}" -n chromecast-tool -- "" "$@") || exit 1
     eval set -- "$OPTS"
 
     # Default address after a factory reset
@@ -71,7 +79,7 @@ parse_options () {
     while true; do
         case "$1" in
             --ssid) WIFI_SSID="$2"; shift 2 ;;
-            --pass) WIFI_PASS="$2"; shift 2 ;;
+            --pass) WIFI_PASS="$2"; WIFI_PASS_SET=1; shift 2 ;;
             --addr) CHROMECAST_IP="$2"; shift 2 ;;
             --name) OPT_NAME="$2"; shift 2 ;;
             --locale) OPT_LOCALE="$2"; shift 2 ;;
@@ -79,6 +87,7 @@ parse_options () {
             --timeformat) OPT_TFORMAT="$2"; shift 2 ;;
             --help) show_usage ;;
             --) shift; break ;;
+            *) abort "Unexpected option '$1'" ;;
         esac
     done
 
@@ -87,70 +96,113 @@ parse_options () {
     fi
 }
 
+# Send a JSON payload to a setup endpoint, discarding the response
+post_json () {
+    $CURL -H "content-type: application/json" -d "$2" -o /dev/null \
+          "https://${CHROMECAST_IP}:8443/setup/$1"
+}
+
+# Extract a field with jq -r. The 'tr' strips the CR that jq.exe adds on
+# Windows (Git Bash / MSYS2), which would otherwise end up in the values.
+jq_get () {
+    printf '%s' "$1" | jq -r "$2" | tr -d '\r'
+}
+
 get_chromecast_info () {
     echo -n "Trying to connect to the Chromecast with IP ${CHROMECAST_IP} ... "
-    CHROMECAST_INFO="$($CURL https://${CHROMECAST_IP}:8443/setup/eureka_info || true)"
-    CHROMECAST_NAME="$(echo "${CHROMECAST_INFO}" | jq -r '.name')"
-    CHROMECAST_LOCALE="$(echo "${CHROMECAST_INFO}" | jq -r '.locale')"
-    CHROMECAST_TZ="$(echo "${CHROMECAST_INFO}" | jq -r '.timezone')"
-    CHROMECAST_TFORMAT="$(echo "${CHROMECAST_INFO}" | jq -r '.time_format')"
-    CHROMECAST_SSID="$(echo "${CHROMECAST_INFO}" | jq -r '.ssid')"
-    CHROMECAST_PUBKEY="$(echo "${CHROMECAST_INFO}" | jq -r '.public_key')"
-    [ -n "$CHROMECAST_NAME" ] || abort "ERROR"
+    CHROMECAST_INFO="$($CURL "https://${CHROMECAST_IP}:8443/setup/eureka_info" || true)"
+    printf '%s' "${CHROMECAST_INFO}" | jq -e 'type == "object"' > /dev/null 2>&1 \
+        || abort "ERROR: no valid response from the Chromecast"
+    CHROMECAST_NAME="$(jq_get "${CHROMECAST_INFO}" '.name // empty')"
+    CHROMECAST_LOCALE="$(jq_get "${CHROMECAST_INFO}" '.locale // empty')"
+    CHROMECAST_TZ="$(jq_get "${CHROMECAST_INFO}" '.timezone // empty')"
+    CHROMECAST_TFORMAT="$(jq_get "${CHROMECAST_INFO}" '.time_format // empty')"
+    CHROMECAST_SSID="$(jq_get "${CHROMECAST_INFO}" '.ssid // empty')"
+    CHROMECAST_PUBKEY="$(jq_get "${CHROMECAST_INFO}" '.public_key // empty')"
+    [ -n "$CHROMECAST_NAME" ] || abort "ERROR: unexpected response from the Chromecast"
     echo "done"
 
     cat <<-EOF
 	Current Chromecast settings:
 	   Name: $CHROMECAST_NAME
 	   Configured wifi network: ${CHROMECAST_SSID:-(none)}
-	   Locale: $CHROMECAST_LOCALE
-	   Timezone: $CHROMECAST_TZ
-	   Time format: $CHROMECAST_TFORMAT
+	   Locale: ${CHROMECAST_LOCALE:-(unknown)}
+	   Timezone: ${CHROMECAST_TZ:-(unknown)}
+	   Time format: ${CHROMECAST_TFORMAT:-(unknown)}
 EOF
 }
 
+read_password () {
+    [ -t 0 ] || abort "ERROR: --pass not given and no terminal to read it from"
+    printf 'Wifi password for %s: ' "$WIFI_SSID" >&2
+    stty -echo
+    trap 'stty echo' EXIT
+    IFS= read -r WIFI_PASS || true
+    stty echo
+    trap - EXIT
+    echo >&2
+}
+
 connect_wifi () {
-    require_cmd openssl
+    require_cmd openssl base64
     parse_options "ssid:,pass:" "$@"
 
-    if [ -z "${WIFI_SSID}" -o -z "${WIFI_PASS}" ]; then
-        abort "ERROR: both --ssid and --pass must be specified"
-    fi
+    [ -n "${WIFI_SSID}" ] || abort "ERROR: --ssid must be specified"
+    [ -n "${WIFI_PASS_SET}" ] || read_password
+    [ -n "${WIFI_PASS}" ] || abort "ERROR: the wifi password cannot be empty"
 
     get_chromecast_info
-    echo -n "Scanning wifi networks 0%..."
-    $CURL -X POST https://${CHROMECAST_IP}:8443/setup/scan_wifi
-    for f in $(seq 10 10 90); do
-        echo -n "${f}%..."
-        sleep 1
-    done
-    echo "100%"
+    [ -n "$CHROMECAST_PUBKEY" ] || abort "ERROR: the Chromecast did not report a public key"
 
-    echo -n "Getting the details of the $WIFI_SSID network from the scan results ... "
-    RESULT="$($CURL https://${CHROMECAST_IP}:8443/setup/scan_results)"
-    WIFI_DETAILS="$(echo "${RESULT}" | jq ".[] | select(.ssid == \"${WIFI_SSID}\")")"
-    [ -n "$WIFI_DETAILS" ] || abort "ERROR: wifi network with SSID $WIFI_SSID not found"
-    WPA_AUTH="$(echo "${WIFI_DETAILS}" | jq -r '.wpa_auth')"
-    WPA_CIPHER="$(echo "${WIFI_DETAILS}" | jq -r '.wpa_cipher')"
-    echo "done"
+    echo -n "Scanning wifi networks ..."
+    $CURL -X POST -o /dev/null "https://${CHROMECAST_IP}:8443/setup/scan_wifi" \
+        || abort " ERROR: cannot start the wifi scan"
+
+    # Poll the scan results until the network shows up or we give up
+    WIFI_DETAILS=""
+    i=0
+    while [ "$i" -lt "$SCAN_ATTEMPTS" ]; do
+        sleep 1
+        echo -n "."
+        RESULT="$($CURL "https://${CHROMECAST_IP}:8443/setup/scan_results" || true)"
+        WIFI_DETAILS="$(printf '%s' "${RESULT}" | \
+            jq -c --arg ssid "$WIFI_SSID" \
+               'first(.[]? | select(.ssid == $ssid)) // empty' 2>/dev/null || true)"
+        [ -n "$WIFI_DETAILS" ] && break
+        i=$((i + 1))
+    done
+    echo " done"
+
+    if [ -z "$WIFI_DETAILS" ]; then
+        abort "ERROR: wifi network with SSID '$WIFI_SSID' not found
+(note: 1st gen Chromecasts only support 2.4 GHz networks)"
+    fi
+    WPA_AUTH="$(jq_get "${WIFI_DETAILS}" '.wpa_auth')"
+    WPA_CIPHER="$(jq_get "${WIFI_DETAILS}" '.wpa_cipher')"
 
     # Encrypt the wifi password
-    KEYFILE=$(mktemp ${TMPDIR:-/tmp}/cast.XXXXXX)
-    trap "rm -f $KEYFILE" EXIT
-    trap true INT
-    echo '-----BEGIN PUBLIC KEY-----' > $KEYFILE
-    echo "$CHROMECAST_PUBKEY"        >> $KEYFILE
-    echo '-----END PUBLIC KEY-----'  >> $KEYFILE
-    ENC_PASSWORD=$(echo -n "$WIFI_PASS" | openssl pkeyutl -encrypt -inkey $KEYFILE -pubin | base64 -w 0)
+    KEYFILE=$(mktemp "${TMPDIR:-/tmp}/cast.XXXXXX")
+    trap 'rm -f "$KEYFILE"' EXIT
+    trap 'exit 130' INT TERM
+    {
+        echo '-----BEGIN PUBLIC KEY-----'
+        echo "$CHROMECAST_PUBKEY"
+        echo '-----END PUBLIC KEY-----'
+    } > "$KEYFILE"
+    ENC_PASSWORD=$(printf '%s' "$WIFI_PASS" | \
+                   openssl pkeyutl -encrypt -inkey "$KEYFILE" -pubin | base64 | tr -d '\n')
+    [ -n "$ENC_PASSWORD" ] || abort "ERROR: cannot encrypt the wifi password"
 
-    echo -n "Connecting Chromecast to the $WIFI_SSID network ..."
-    CMD="{\"ssid\": \"${WIFI_SSID}\", \"wpa_auth\": ${WPA_AUTH}, \"wpa_cipher\": ${WPA_CIPHER}, \"enc_passwd\": \"${ENC_PASSWORD}\"}"
-    $CURL -H "content-type: application/json" -d "${CMD}" https://${CHROMECAST_IP}:8443/setup/connect_wifi
+    echo -n "Connecting Chromecast to the $WIFI_SSID network ... "
+    CMD="$(jq -n --arg ssid "$WIFI_SSID" --arg pw "$ENC_PASSWORD" \
+                 --argjson auth "$WPA_AUTH" --argjson cipher "$WPA_CIPHER" \
+                 '{ssid: $ssid, wpa_auth: $auth, wpa_cipher: $cipher, enc_passwd: $pw}')"
+    post_json connect_wifi "$CMD" || abort "ERROR: connect_wifi request failed"
     echo "done"
 
-    echo -n "Saving changes ..."
-    CMD="{\"keep_hotspot_until_connected\": true}"
-    $CURL -H "content-type: application/json" -d "${CMD}" -o /dev/null https://${CHROMECAST_IP}:8443/setup/save_wifi
+    echo -n "Saving changes ... "
+    post_json save_wifi '{"keep_hotspot_until_connected": true}' \
+        || abort "ERROR: save_wifi request failed"
     echo "done"
 }
 
@@ -162,43 +214,52 @@ get_config () {
 set_config () {
     parse_options "name:,locale:,timezone:,timeformat:" "$@"
 
-    local CMD="\"settings\": {"
-    [ -n "$OPT_LOCALE" ]  && CMD="${CMD} \"locale\": \"${OPT_LOCALE}\","
-    [ -n "$OPT_TZ" ]      && CMD="${CMD} \"timezone\": \"${OPT_TZ}\","
-    [ -n "$OPT_TFORMAT" ] && CMD="${CMD} \"time_format\": ${OPT_TFORMAT},"
-    CMD="${CMD%,} }" # Remove the trailing comma and close the 'settings' brace
+    if [ -z "$OPT_NAME$OPT_LOCALE$OPT_TZ$OPT_TFORMAT" ]; then
+        abort "ERROR: nothing to change, see --help for the available options"
+    fi
 
-    [ -n "$OPT_NAME" ] && CMD="\"name\": \"${OPT_NAME}\", ${CMD}"
+    if [ -n "$OPT_TFORMAT" ]; then
+        case "$OPT_TFORMAT" in
+            1|2) ;;
+            *) abort "ERROR: --timeformat must be 1 or 2" ;;
+        esac
+    fi
 
-    CMD="{${CMD}}"
-    echo -n "Changing the Chromecast settings ..."
-    $CURL -H "content-type: application/json" -d "${CMD}" -o /dev/null https://${CHROMECAST_IP}:8443/setup/set_eureka_info
+    # Only include the fields that were actually given
+    CMD="$(jq -n --arg name "$OPT_NAME" --arg locale "$OPT_LOCALE" \
+                 --arg tz "$OPT_TZ" --arg tformat "$OPT_TFORMAT" '
+        ({settings: ({}
+            + (if $locale  != "" then {locale: $locale}               else {} end)
+            + (if $tz      != "" then {timezone: $tz}                 else {} end)
+            + (if $tformat != "" then {time_format: ($tformat|tonumber)} else {} end))})
+        + (if $name != "" then {name: $name} else {} end)')"
+
+    echo -n "Changing the Chromecast settings ... "
+    post_json set_eureka_info "$CMD" || abort "ERROR: set_eureka_info request failed"
     echo "done"
+}
+
+get_list () {
+    echo -n "Trying to connect to the Chromecast with IP ${CHROMECAST_IP} ... "
+    RESULT="$($CURL "https://${CHROMECAST_IP}:8443/setup/$1" || true)"
+    [ -n "$RESULT" ] || abort "ERROR: no response from the Chromecast"
+    echo "done"
+    jq_get "$RESULT" ".[] | .$2"
 }
 
 get_locales () {
     parse_options "" "$@"
-
-    echo -n "Trying to connect to the Chromecast with IP ${CHROMECAST_IP} ... "
-    RESULT="$($CURL https://${CHROMECAST_IP}:8443/setup/supported_locales || true)"
-    [ -n "$RESULT" ] || abort "ERROR"
-    echo "done"
-    echo $RESULT | jq -r '.[] | .locale'
+    get_list supported_locales locale
 }
 
 get_timezones () {
     parse_options "" "$@"
-
-    echo -n "Trying to connect to the Chromecast with IP ${CHROMECAST_IP} ... "
-    RESULT="$($CURL https://${CHROMECAST_IP}:8443/setup/supported_timezones || true)"
-    [ -n "$RESULT" ] || abort "ERROR"
-    echo "done"
-    echo $RESULT | jq -r '.[] | .timezone'
+    get_list supported_timezones timezone
 }
 
 [ "$#" = 0 ] && show_usage
 
-require_cmd curl jq
+require_cmd curl jq getopt
 
 case "$1" in
     connect-wifi)  shift; connect_wifi "$@";;

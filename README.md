@@ -50,7 +50,11 @@ $ chromecast-tool set-config --name MyChromecast \
 ```
 5. Connect the Chromecast to your home Wi-Fi network:
 ```
-$ chromecast-tool connect-wifi --ssid MyNetwork --pass MyPassword
+$ chromecast-tool connect-wifi --ssid MyNetwork
 ```
+   The Wi-Fi password is prompted for without echoing it (you can also
+   pass it with `--pass`, but then it ends up in your shell history).
+   Note that 1st generation Chromecasts only support 2.4 GHz networks,
+   and the network must be visible (not hidden) in the scan.
 6. The Chromecast's private network disappears and the device is ready
    to use.
