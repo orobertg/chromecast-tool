@@ -22,7 +22,11 @@ set -e
 CURL="curl -sS --fail --insecure --tlsv1.2 --tls-max 1.2"
 
 # How many times to poll for the wifi scan results (1 second apart)
-SCAN_ATTEMPTS=20
+SCAN_ATTEMPTS=${SCAN_ATTEMPTS:-20}
+
+# How long to wait (in 2 second steps) for the Chromecast to leave its
+# setup network after connect-wifi
+VERIFY_ATTEMPTS=${VERIFY_ATTEMPTS:-45}
 
 abort () {
     echo "$1" >&2
@@ -35,6 +39,8 @@ show_usage () {
 
 	Available commands:
 	   connect-wifi   Connect the Chromecast to a Wifi network.
+	   scan-wifi      List the Wifi networks the Chromecast can see.
+	   find           Find Chromecasts on your local network(s).
 	   get-config     Show the current Chromecast settings.
 	   set-config     Change some of the Chromecast settings.
 	   get-locales    Get list of supported locales.
@@ -49,6 +55,12 @@ show_usage () {
 	   --ssid         Connect the Chromecast to this network.
 	   --pass         Wifi password. If omitted it is read from the
 	                  terminal without echoing it.
+	   --no-wait      Don't wait to check whether the Chromecast joined
+	                  the network.
+
+	Options for the 'find' command:
+	   --subnet       Scan this /24 network, e.g. 192.168.1 (default: the
+	                  private networks this computer is connected to).
 
 	Options for the 'set-config' command:
 	   --name         Set the visible name of the Chromecast.
@@ -61,7 +73,9 @@ EOF
 
 require_cmd () {
     for cmd in "$@"; do
-        command -v "$cmd" > /dev/null || abort "ERROR: $cmd not found"
+        command -v "$cmd" > /dev/null || abort "ERROR: $cmd not found
+(see 'Dependencies' in the README; on Windows: winget install jqlang.jq,
+ then open a new terminal)"
     done
 }
 
@@ -85,6 +99,8 @@ parse_options () {
             --locale) OPT_LOCALE="$2"; shift 2 ;;
             --timezone) OPT_TZ="$2"; shift 2 ;;
             --timeformat) OPT_TFORMAT="$2"; shift 2 ;;
+            --subnet) OPT_SUBNET="$2"; shift 2 ;;
+            --no-wait) OPT_NO_WAIT=1; shift ;;
             --help) show_usage ;;
             --) shift; break ;;
             *) abort "Unexpected option '$1'" ;;
@@ -134,13 +150,13 @@ EOF
 
 read_password () {
     [ -t 0 ] || abort "ERROR: --pass not given and no terminal to read it from"
-    stty -echo
-    trap 'stty echo' EXIT
+    stty -echo 2> /dev/null || echo "(note: this terminal will show the password as you type)" >&2
+    trap 'stty echo 2> /dev/null' EXIT
     printf 'Wifi password for %s: ' "$WIFI_SSID" >&2
     IFS= read -r WIFI_PASS || true
     printf '\nConfirm password: ' >&2
     IFS= read -r WIFI_PASS2 || true
-    stty echo
+    stty echo 2> /dev/null || true
     trap - EXIT
     echo >&2
     # Some Windows terminals (mintty) can leave a CR at the end of the line
@@ -152,7 +168,7 @@ read_password () {
 
 connect_wifi () {
     require_cmd openssl base64
-    parse_options "ssid:,pass:" "$@"
+    parse_options "ssid:,pass:,no-wait" "$@"
 
     [ -n "${WIFI_SSID}" ] || abort "ERROR: --ssid must be specified"
     [ -n "${WIFI_PASS_SET}" ] || read_password
@@ -161,28 +177,15 @@ connect_wifi () {
     get_chromecast_info
     [ -n "$CHROMECAST_PUBKEY" ] || abort "ERROR: the Chromecast did not report a public key"
 
-    echo -n "Scanning wifi networks ..."
-    $CURL -X POST -o /dev/null "https://${CHROMECAST_IP}:8443/setup/scan_wifi" \
-        || abort " ERROR: cannot start the wifi scan"
-
-    # Poll the scan results until the network shows up or we give up
-    WIFI_DETAILS=""
-    i=0
-    while [ "$i" -lt "$SCAN_ATTEMPTS" ]; do
-        sleep 1
-        echo -n "."
-        RESULT="$($CURL "https://${CHROMECAST_IP}:8443/setup/scan_results" || true)"
-        WIFI_DETAILS="$(printf '%s' "${RESULT}" | \
-            jq -c --arg ssid "$WIFI_SSID" \
-               'first(.[]? | select(.ssid == $ssid)) // empty' 2>/dev/null || true)"
-        [ -n "$WIFI_DETAILS" ] && break
-        i=$((i + 1))
-    done
-    echo " done"
+    scan_wifi_networks "$WIFI_SSID"
+    WIFI_DETAILS="$(printf '%s' "${SCAN_RESULT}" | \
+        jq -c --arg ssid "$WIFI_SSID" \
+           'first(.[]? | select(.ssid == $ssid)) // empty' 2>/dev/null || true)"
 
     if [ -z "$WIFI_DETAILS" ]; then
         abort "ERROR: wifi network with SSID '$WIFI_SSID' not found
-(note: 1st gen Chromecasts only support 2.4 GHz networks)"
+(note: 1st gen Chromecasts only support 2.4 GHz networks;
+ run 'chromecast-tool scan-wifi' to see the networks it can find)"
     fi
     WPA_AUTH="$(jq_get "${WIFI_DETAILS}" '.wpa_auth')"
     WPA_CIPHER="$(jq_get "${WIFI_DETAILS}" '.wpa_cipher')"
@@ -211,6 +214,159 @@ connect_wifi () {
     post_json save_wifi '{"keep_hotspot_until_connected": true}' \
         || abort "ERROR: save_wifi request failed"
     echo "done"
+
+    [ -n "$OPT_NO_WAIT" ] || verify_connection
+}
+
+# Ask the Chromecast to scan for networks and poll until the results are
+# available. If an SSID is given, stop as soon as it shows up. The last
+# results are left in SCAN_RESULT.
+scan_wifi_networks () {
+    local want="$1" i=0 n match
+    echo -n "Scanning wifi networks ..."
+    $CURL -X POST -o /dev/null "https://${CHROMECAST_IP}:8443/setup/scan_wifi" \
+        || abort " ERROR: cannot start the wifi scan"
+
+    SCAN_RESULT=""
+    while [ "$i" -lt "$SCAN_ATTEMPTS" ]; do
+        sleep 1
+        echo -n "."
+        SCAN_RESULT="$($CURL "https://${CHROMECAST_IP}:8443/setup/scan_results" 2>/dev/null || true)"
+        if [ -n "$want" ]; then
+            match="$(printf '%s' "$SCAN_RESULT" | jq -r --arg ssid "$want" \
+                     'first(.[]? | select(.ssid == $ssid) | "y") // empty' 2>/dev/null || true)"
+            [ -n "$match" ] && break
+        else
+            # Give the scan a few seconds to collect results
+            n="$(printf '%s' "$SCAN_RESULT" | jq 'if type == "array" then length else 0 end' \
+                 2>/dev/null | tr -d '\r' || true)"
+            [ "${n:-0}" -gt 0 ] && [ "$i" -ge 4 ] && break
+        fi
+        i=$((i + 1))
+    done
+    echo " done"
+}
+
+# After connect-wifi the Chromecast keeps its setup network up until it has
+# joined the new network, and then turns it off. So losing contact with it
+# is the sign that it (most likely) worked.
+verify_connection () {
+    local i=0 misses=0
+    echo -n "Waiting for the Chromecast to join $WIFI_SSID ..."
+    while [ "$i" -lt "$VERIFY_ATTEMPTS" ]; do
+        sleep 2
+        echo -n "."
+        if $CURL --max-time 3 -o /dev/null \
+                "https://${CHROMECAST_IP}:8443/setup/eureka_info" 2>/dev/null; then
+            misses=0
+        else
+            misses=$((misses + 1))
+            if [ "$misses" -ge 2 ]; then
+                echo " done"
+                cat <<-EOF
+	The Chromecast left its setup network, which usually means it joined
+	$WIFI_SSID. The TV should now say "Ready to cast".
+	If it says it can't connect instead, the password was probably wrong:
+	reconnect to its setup network and run connect-wifi again.
+	To check from this computer, reconnect it to $WIFI_SSID and run:
+	   chromecast-tool find
+EOF
+                return 0
+            fi
+        fi
+        i=$((i + 1))
+    done
+    echo
+    abort "WARNING: the Chromecast is still on its setup network after $((VERIFY_ATTEMPTS * 2)) seconds,
+so it probably could not join $WIFI_SSID. The most common cause is a
+wrong password. Check the TV screen and run connect-wifi again."
+}
+
+scan_wifi () {
+    parse_options "" "$@"
+    get_chromecast_info > /dev/null
+    scan_wifi_networks ""
+    printf '%s' "$SCAN_RESULT" | jq -e 'type == "array" and length > 0' > /dev/null 2>&1 \
+        || abort "ERROR: the Chromecast did not find any networks"
+
+    printf '%-8s %-9s %s\n' "SIGNAL" "SECURITY" "SSID"
+    # One line per SSID (strongest access point), strongest first.
+    # wpa_auth: 1 = open, 7 = WPA2-PSK (other values shown as numbers)
+    printf '%s' "$SCAN_RESULT" | jq -r '
+        group_by(.ssid)
+        | map(max_by(.signal_level // -999))
+        | sort_by(-(.signal_level // -999))
+        | .[]
+        | [ ((.signal_level // "?") | tostring),
+            (if .wpa_auth == 1 then "open"
+             elif .wpa_auth == 7 then "WPA2"
+             else "type " + ((.wpa_auth // "?") | tostring) end),
+            (if (.ssid // "") == "" then "(hidden)" else .ssid end) ]
+        | @tsv' | tr -d '\r' | while IFS="$(printf '\t')" read -r sig sec ssid; do
+            printf '%-8s %-9s %s\n' "$sig" "$sec" "$ssid"
+        done
+    echo "(1st gen Chromecasts only see 2.4 GHz networks; 5 GHz-only ones are not listed)"
+}
+
+# Print the first three octets of the private IPv4 networks we are on
+local_subnets () {
+    if command -v ipconfig > /dev/null 2>&1; then
+        ipconfig | tr -d '\r' | sed -n 's/.*IPv4[^:]*: *\([0-9.]*\).*/\1/p'
+    elif command -v ip > /dev/null 2>&1; then
+        ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1
+    else
+        ifconfig 2> /dev/null | sed -n 's/.*inet \(addr:\)\{0,1\}\([0-9.]*\).*/\2/p'
+    fi | grep -E '^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)' | cut -d. -f1-3 | sort -u
+}
+
+# Print "IP<TAB>name" if there is a Chromecast at the given address
+probe_device () {
+    local info name
+    info="$(curl -s --max-time 2 "http://$1:8008/setup/eureka_info" 2>/dev/null || true)"
+    if [ -z "$info" ]; then
+        info="$($CURL --max-time 2 "https://$1:8443/setup/eureka_info" 2>/dev/null || true)"
+    fi
+    name="$(printf '%s' "$info" | jq -r '.name // empty' 2>/dev/null | tr -d '\r' || true)"
+    [ -z "$name" ] || printf '%s\t%s\n' "$1" "$name"
+}
+
+find_devices () {
+    local subnets net i outdir found
+    parse_options "subnet:" "$@"
+    if [ -n "$OPT_SUBNET" ]; then
+        # Accept both 192.168.1 and 192.168.1.0
+        case "$OPT_SUBNET" in
+            *.*.*.*) subnets="${OPT_SUBNET%.*}" ;;
+            *) subnets="$OPT_SUBNET" ;;
+        esac
+    else
+        subnets="$(local_subnets)"
+    fi
+    [ -n "$subnets" ] || abort "ERROR: no local network found, use --subnet"
+
+    outdir=$(mktemp -d "${TMPDIR:-/tmp}/cast.XXXXXX")
+    trap 'rm -rf "$outdir"' EXIT
+    for net in $subnets; do
+        echo "Searching ${net}.1-254 ..."
+        i=1
+        while [ "$i" -le 254 ]; do
+            probe_device "${net}.$i" > "$outdir/$net.$i" &
+            i=$((i + 1))
+        done
+        wait
+    done
+
+    found="$(cat "$outdir"/* 2>/dev/null | sort -t. -k4 -n)"
+    if [ -z "$found" ]; then
+        abort "No Chromecasts found. If it is still on its setup network, connect
+to that network instead. If your router has 'AP isolation' or 'client
+isolation' enabled, devices cannot see each other: turn it off."
+    fi
+    echo "Found:"
+    printf '%s\n' "$found" | while IFS="$(printf '\t')" read -r ip name; do
+        printf '   %-16s %s\n' "$ip" "$name"
+    done
+    echo "Use --addr <IP> with the other commands to talk to a device."
 }
 
 get_config () {
@@ -270,9 +426,12 @@ require_cmd curl jq getopt
 
 case "$1" in
     connect-wifi)  shift; connect_wifi "$@";;
+    scan-wifi)     shift; scan_wifi "$@";;
+    find)          shift; find_devices "$@";;
     get-config)    shift; get_config "$@";;
     set-config)    shift; set_config "$@";;
     get-locales)   shift; get_locales "$@";;
     get-timezones) shift; get_timezones "$@";;
+    help|-h|--help) show_usage;;
     *) abort "Unknown command '$1'";;
 esac
